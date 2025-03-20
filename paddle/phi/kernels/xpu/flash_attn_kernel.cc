@@ -15,6 +15,7 @@
 #include "paddle/phi/kernels/flash_attn_kernel.h"
 #include "paddle/phi/backends/xpu/enforce_xpu.h"
 #include "paddle/phi/core/kernel_registry.h"
+#include "glog/logging.h"
 #ifdef PADDLE_WITH_XPU_XRE5
 #include "paddle/phi/kernels/xpu/flash_attn_utils.h"
 #include "xfa/flash_api.h"
@@ -240,9 +241,28 @@ void FlashAttnUnpaddedKernel(
   const XPUType* q_data = reinterpret_cast<const XPUType*>(q.data<T>());
   const XPUType* k_data = reinterpret_cast<const XPUType*>(k.data<T>());
   const XPUType* v_data = reinterpret_cast<const XPUType*>(v.data<T>());
+  const float* attn_mask_data = attn_mask ? reinterpret_cast<const float*>(attn_mask.get().data<float>()) : nullptr;
   if (!is_cross_attn) {
     xpu::VectorParam<int32_t> lods{
         qlod_vec.data(), (int32_t)(qlod_vec.size()), nullptr};
+    std::vector<int64_t> z_shape = {};
+    if(attn_mask) {
+      z_shape = {1, 1, 1, 1};
+      auto mask_dim = attn_mask.get().dims();
+      int mask_dim_size = mask_dim.size();
+      if (mask_dim_size < 4) {
+        int index = 4 - mask_dim_size;
+        for (int i = 0; i < mask_dim_size; ++i) {
+          z_shape[index + i] = mask_dim[i];
+        }
+      } else {
+        // mask_dim_size = 4
+        // The check in fusion.cc has ensured that it is not greater than 4
+        for (int i = 0; i < mask_dim_size; ++i) {
+          z_shape[i] = mask_dim[i];
+        }
+      }
+    }
     xpu::QKVAttnParam qkv_attn_param(
         lods,                     // only support qlods == kvlods
         num_heads,                // head_nums
@@ -255,13 +275,18 @@ void FlashAttnUnpaddedKernel(
         false,                    // is_pre_norm(unused param)
         false,                    // is_perchannel(unused param)
         0,                        // qkv_shape
-        {},                       // z_shape
+        z_shape,                       // z_shape
         AttnMacMaxPtrType_t::ATTN_WHOLE_BATCH,  // max_ptr_type
         -1,                                     // ldz(unused param)
         {},                                     // sqlod(unused param)
         scale);                                 // alpha
     qkv_attn_param.triangle_mask_autogen = causal;
     qkv_attn_param.key_value_head_num = num_heads_k;
+    if(attn_mask) {
+      VLOG(3) << "mask_ld: " << qkv_attn_param.mask_ld << " zshape: " << qkv_attn_param.zshape[0] << " " << qkv_attn_param.zshape[1] << " "
+                << " " << qkv_attn_param.zshape[2] << " " << qkv_attn_param.zshape[3] << " batch: " << qkv_attn_param.batch
+                << " head_num: " << qkv_attn_param.head_num << " max_seqlen: " << qkv_attn_param.max_seqlen;
+    }
     r = xpu::qkv_attention<XPUType,
                            XPUType,
                            XPUType,
@@ -280,7 +305,7 @@ void FlashAttnUnpaddedKernel(
                                   nullptr,   // max_v
                                   nullptr,   // max_ctx
                                   qkv_attn_param,
-                                  nullptr,
+                                  attn_mask_data,
                                   nullptr,
                                   nullptr);
     PADDLE_ENFORCE_EQ(r, 0, "xpu::qkv_attention failed.");

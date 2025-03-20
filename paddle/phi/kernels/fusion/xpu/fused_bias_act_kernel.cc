@@ -34,14 +34,16 @@ static void DispatchComputeImpl(const phi::XPUContext *xpu_ctx,
                                 const float quant_min_bound,
                                 DenseTensor *out) {
   PADDLE_THROW(
-      common::errors::Unimplemented("fused_bias_act with smooth "
-                                    "quant on xpu is not implemented yet."));
+      common::errors::Unimplemented("fused_bias_act with quant "
+                                    "dequant on xpu is not implemented yet."));
 }
 
 template <typename T>
 static void ComputeImpl(const phi::XPUContext *xpu_ctx,
                         const DenseTensor &x,
                         const paddle::optional<DenseTensor> &bias,
+                        const paddle::optional<DenseTensor> &shift,
+                        const paddle::optional<DenseTensor> &smooth,
                         const std::string &act_method,
                         DenseTensor *out) {
   using XPUType = typename XPUTypeTrait<T>::Type;
@@ -64,15 +66,43 @@ static void ComputeImpl(const phi::XPUContext *xpu_ctx,
         "NOT supported GeGLU. "
         "Currently Only Support SwiGLU, GeLU, ReLU");
   } else if (act_method == "swiglu") {
-    r = baidu::xpu::api::swiglu<XPUType>(
-        xpu_ctx->x_context(),
-        reinterpret_cast<const XPUType *>(x.data<T>()),
-        reinterpret_cast<XPUType *>(out->data<T>()),
-        {rows, cols},
-        1,
-        true);
-    PADDLE_ENFORCE_EQ(
-        r, 0, common::errors::Fatal("baidu::xpu::api::swiglu failed."));
+    if (shift && smooth) {
+      // phi::DenseTensor out_tmp;
+      // out_tmp.Resize({{rows, cols}});
+      // xpu_ctx->template Alloc<T>(&out_tmp, out_tmp.numel() * sizeof(T));
+      r = baidu::xpu::api::swiglu_add_mul_fusion<XPUType>(
+          xpu_ctx->x_context(),
+          reinterpret_cast<const XPUType *>(x.data<T>()),
+          reinterpret_cast<XPUType *>(out->data<T>()),
+          rows,
+          cols,
+          reinterpret_cast<const XPUType *>(shift.get().data<T>()),
+          reinterpret_cast<const XPUType *>(smooth.get().data<T>()),
+          true
+      );
+      PADDLE_ENFORCE_EQ(
+          r, 0, common::errors::Fatal("baidu::xpu::api::swiglu_add_mul_fusion failed."));
+      // r = baidu::xpu::api::slice<XPUType>(xpu_ctx->x_context(),
+      //                         reinterpret_cast<const XPUType*>(out_tmp.data<T>()),
+      //                         reinterpret_cast<XPUType*>(out->data<T>()),
+      //                         {rows, cols},
+      //                         {0,0},
+      //                         {rows, cols/2});
+      // PADDLE_ENFORCE_EQ(
+      //     r, 0, common::errors::Fatal("baidu::xpu::api::slice failed."));
+      return;
+    }
+    else {
+      r = baidu::xpu::api::swiglu<XPUType>(
+          xpu_ctx->x_context(),
+          reinterpret_cast<const XPUType *>(x.data<T>()),
+          reinterpret_cast<XPUType *>(out->data<T>()),
+          {rows, cols},
+          1,
+          true);
+      PADDLE_ENFORCE_EQ(
+          r, 0, common::errors::Fatal("baidu::xpu::api::swiglu failed."));
+    }
   } else if (act_method == "gelu") {
     r = baidu::xpu::api::gelu<XPUType>(
         xpu_ctx->x_context(),
@@ -93,6 +123,21 @@ static void ComputeImpl(const phi::XPUContext *xpu_ctx,
     PD_THROW(
         "NOT supported. "
         "Currently Only Support SwiGLU, GeLU, ReLU");
+  }
+  if (shift && smooth) {
+    if(act_method == "geglu" || act_method == "swiglu") {
+      cols = cols / 2;
+    }
+    r = baidu::xpu::api::fusion_smooth_transform<XPUType>(
+        xpu_ctx->x_context(),
+        reinterpret_cast<const XPUType *>(out->data<T>()),
+        reinterpret_cast<const XPUType *>(shift.get().data<T>()),
+        reinterpret_cast<const XPUType *>(smooth.get().data<T>()),
+        reinterpret_cast<XPUType *>(out->data<T>()),
+        rows,
+        cols);
+     PADDLE_ENFORCE_EQ(
+          r, 0, common::errors::Fatal("baidu::xpu::api::fusion_smooth_transform failed."));
   }
 }
 
@@ -127,7 +172,7 @@ void FusedBiasActKernel(const Context &dev_ctx,
                                   quant_min_bound,
                                   out);
   } else {
-    return ComputeImpl<T>(xpu_ctx, x, bias, act_method, out);
+    return ComputeImpl<T>(xpu_ctx, x, bias, shift, smooth, act_method, out);
   }
 }
 
